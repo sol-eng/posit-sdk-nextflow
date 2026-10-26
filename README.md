@@ -1,7 +1,7 @@
 # posit-sdk-nextflow
 
 Run Nextflow tasks as Posit Workbench Jobs, submitted via the Workbench launcher API. Sibling
-project to [`posit-sdk-snakemake`](https://github.com/michaelmayer2/posit-sdk-snakemake), which
+project to [`posit-sdk-snakemake`](https://github.com/sol-eng/posit-sdk-snakemake), which
 does the same for Snakemake -- the two are independent (no shared code), but follow the same
 auth model and job lifecycle.
 
