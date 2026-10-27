@@ -149,7 +149,8 @@ was launched from a Positron session through the
 the session's credentials were picked up (with 0.3.0, through the launcher CLI). So have
 headless runs started from a Positron session, where the driver
 runs as a Workbench Job and submits its tasks with the job's own credentials. Headless runs
-submitted through the Workbench API with `WORKBENCH_API_KEY` have not been tested yet, and 0.4.0's
-built-in API client has so far been tested only against the stand-in, not a live server. Known
+submitted through the Workbench API with `WORKBENCH_API_KEY` have not been tested yet. 0.4.0, with
+the plugin calling the Workbench API itself, has been verified on Workbench through the Positron
+Nextflow extension too. Known
 limitations: no wall-time/disk resource mapping, and log retrieval works only over the shared
 filesystem.

@@ -3,7 +3,7 @@
 All notable changes to `nf-workbench` (the Nextflow plugin) and `posit-workbench-nf-launcher`
 (the launcher CLI) are documented here. The two are versioned together.
 
-## 0.4.0 - unreleased
+## 0.4.0 - 2026-10-27
 
 ### Changed
 
@@ -12,6 +12,7 @@ All notable changes to `nf-workbench` (the Nextflow plugin) and `posit-workbench
 - The launcher CLI is optional, for submitting, listing and stopping jobs from a terminal (e.g. a headless driver). It no longer depends on posit-sdk: it uses a built-in client (standard library only), the same as posit-sdk-snakemake's. `whoami` now checks the credentials with one API call.
 - A Workbench session without a readable RPC cookie falls back to `WORKBENCH_SERVER`/`WORKBENCH_API_KEY`, where posit-sdk failed.
 - The plugin and launcher are now 0.4.0. Update `plugins { id 'nf-workbench@0.4.0' }` in pipeline configs.
+- Verified on Posit Workbench with the Positron Nextflow extension.
 
 ### Added
 
