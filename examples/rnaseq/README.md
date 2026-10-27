@@ -52,7 +52,6 @@ The first run takes longer while the cluster pulls the images.
 | `--outdir DIR` | `results` | Published outputs and execution reports. |
 | `--workbenchCluster NAME` | `Kubernetes` | Sets `workbench.cluster`. |
 | `--workbenchResourceProfile NAME` | unset | Sets `workbench.resourceProfile`. |
-| `--launcherCli PATH` | `posit-workbench-nf-launcher` | Sets `workbench.launcherCli`. |
 | `--workbenchContainer IMG` | `python:3.12-slim` | Fallback `process.container`. Every process declares its own image, so this is rarely used. |
 | `--workbenchQueueSize N` | `10` | Sets `executor.queueSize`, the maximum number of Workbench Jobs submitted at once. |
 

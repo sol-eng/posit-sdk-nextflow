@@ -7,23 +7,24 @@ import groovy.transform.PackageScope
 import groovy.util.logging.Slf4j
 import nextflow.exception.AbortOperationException
 import nextflow.executor.AbstractGridExecutor
+import nextflow.executor.GridTaskHandler
 import nextflow.processor.TaskRun
 import nextflow.util.Escape
 import nextflow.util.ServiceName
 
 /**
- * Executor that runs each Nextflow task as a Posit Workbench Job, by shelling out to the
- * {@code posit-workbench-nf-launcher} CLI (a thin wrapper around the Python {@code posit-sdk})
- * exactly the way Nextflow's built-in Slurm/LSF/SGE executors shell out to
- * {@code sbatch}/{@code bsub}/{@code qsub}.
+ * Executor that runs each Nextflow task as a Posit Workbench Job, through the Workbench
+ * Launcher API ({@link WorkbenchApiClient}). It is a grid executor like Nextflow's Slurm or LSF
+ * executors, except that it calls the API where those run {@code sbatch}/{@code squeue}/
+ * {@code scancel}: {@link WorkbenchTaskHandler} launches a task's job, and
+ * {@link #getQueueStatus0} and {@link #killTask} list and stop jobs.
  *
  * Users select this executor with {@code process.executor = 'workbench'} and must set the
  * target cluster in the plugin's own {@code workbench} scope (see {@link WorkbenchConfig}):
  * <pre>
  * workbench {
- *     cluster = 'my-cluster'                        // required
- *     launcherCli = 'posit-workbench-nf-launcher'    // optional, defaults to this
- *     resourceProfile = 'small'                      // optional, cluster's default if unset
+ *     cluster = 'my-cluster'      // required
+ *     resourceProfile = 'small'   // optional, cluster's default if unset
  * }
  * </pre>
  * A single process can override the resource profile with {@code ext.resourceProfile = 'large'}.
@@ -33,12 +34,9 @@ import nextflow.util.ServiceName
  * staging, the generated {@code .command.run} wrapper script, and completion detection (via the
  * {@code .exitcode} file -- see {@code GridTaskHandler}) all go through {@code task.workDir}.
  *
- * Authentication is handled entirely inside the CLI subprocess, which inherits whatever
- * environment this JVM process was started with: an ambient Workbench session (interactive use
- * from a Positron/RStudio Pro session) is picked up automatically, otherwise
- * {@code WORKBENCH_SERVER}/{@code WORKBENCH_API_KEY} must be set (headless use, e.g. when the
- * whole {@code nextflow run} invocation is itself submitted as a Workbench Job via the
- * Workbench API).
+ * Credentials come from this JVM's environment: inside a Workbench session or job, the
+ * session's RPC cookie (interactive use from Positron or RStudio Pro, and a {@code nextflow run}
+ * that is itself a Workbench Job); anywhere else {@code WORKBENCH_SERVER}/{@code WORKBENCH_API_KEY}.
  */
 @Slf4j
 @CompileStatic
@@ -46,29 +44,45 @@ import nextflow.util.ServiceName
 class WorkbenchExecutor extends AbstractGridExecutor {
 
     @PackageScope String cluster
-    @PackageScope String launcherCli
     @PackageScope String resourceProfile
+    /** made from the environment when first needed */
+    private WorkbenchApiClient client
 
     @Override
     void register() {
         super.register()
         final opts = new WorkbenchConfig((session.config.get('workbench') ?: [:]) as Map)
         cluster = opts.cluster
-        launcherCli = opts.launcherCli
         resourceProfile = opts.resourceProfile
         if( !cluster )
             throw new AbortOperationException(
                 "Missing required config `workbench.cluster` -- set it to a valid " +
-                "Workbench compute env/cluster name, e.g. one of " +
-                "`Client().compute_envs.list()['clusters'][*]['name']`"
+                "Workbench compute env/cluster name (see `get_compute_envs` in the Workbench API)"
             )
-        log.debug "[WORKBENCH] cluster=$cluster launcherCli=$launcherCli resourceProfile=$resourceProfile"
+        if( opts.launcherCli )
+            log.warn "[WORKBENCH] `workbench.launcherCli` is no longer used: the plugin calls the Workbench API itself"
+        log.debug "[WORKBENCH] cluster=$cluster resourceProfile=$resourceProfile"
+    }
+
+    @PackageScope WorkbenchApiClient client() {
+        if( client == null )
+            client = new WorkbenchApiClient()
+        return client
+    }
+
+    /** for tests */
+    @PackageScope void setClient(WorkbenchApiClient client) {
+        this.client = client
+    }
+
+    @Override
+    GridTaskHandler createTaskHandler(TaskRun task) {
+        return new WorkbenchTaskHandler(task, this)
     }
 
     /**
-     * Resources are passed directly on the submit command line (see {@link #getSubmitCommandLine}),
-     * not via embedded job-script header directives -- the Workbench Jobs API takes structured
-     * fields, not a scheduler-parsed script header. Nothing to add here.
+     * Resources are passed as structured fields of the job (see {@link #jobSpec}), not via
+     * embedded job-script header directives. Nothing to add here.
      */
     @Override
     protected List<String> getDirectives(TaskRun task, List<String> initial) {
@@ -91,28 +105,38 @@ class WorkbenchExecutor extends AbstractGridExecutor {
         return "export HOME=${Escape.path(home)} USER=${user} LOGNAME=${user}\n" + base
     }
 
-    @Override
-    List<String> getSubmitCommandLine(TaskRun task, Path scriptFile) {
-        final cmd = [launcherCli, 'submit', '--cluster', cluster, '--name', getJobNameFor(task)]
-
+    /**
+     * The Launcher API job for a task: {@code /bin/bash .command.run} in the task's work
+     * directory, with its cpus, memory, container and resource profile.
+     */
+    @PackageScope Map<String, Object> jobSpec(TaskRun task, Path scriptFile) {
+        final spec = new LinkedHashMap<String, Object>()
+        spec.cluster = cluster
+        spec.name = getJobNameFor(task)
+        spec.exe = '/bin/bash'
+        spec.args = [scriptFile.toAbsolutePath().toString()]
+        spec.workingDirectory = task.workDir.toAbsolutePath().toString()
+        final limits = []
         final cpus = task.config.getCpus()
         if( cpus > 1 )
-            cmd << '--cpus' << cpus.toString()
-
+            limits << [type: 'cpuCount', value: cpus.toString()]
         final mem = task.config.getMemory()
         if( mem )
-            cmd << '--mem-mb' << mem.toMega().toString()
-
+            limits << [type: 'memory', value: mem.toMega().toString()]
+        if( limits )
+            spec.resourceLimits = limits
         final container = task.getContainer()
         if( container )
-            cmd << '--container' << container
-
+            spec.container = [image: container]
         final profile = resourceProfileFor(task)
         if( profile )
-            cmd << '--resource-profile' << profile
+            spec.resourceProfile = profile
+        return spec
+    }
 
-        cmd << scriptFile.getName()
-        return cmd
+    /** Launch a task's job; returns its id. Called by {@link WorkbenchTaskHandler}. */
+    @PackageScope String submitJob(TaskRun task, Path scriptFile) {
+        return client().launchJob(jobSpec(task, scriptFile))
     }
 
     /**
@@ -124,46 +148,91 @@ class WorkbenchExecutor extends AbstractGridExecutor {
         return (ext?.get('resourceProfile') ?: resourceProfile) as String
     }
 
+    /**
+     * Not run: {@link WorkbenchTaskHandler} launches jobs with the API. Describes the submit for
+     * Nextflow's logs and error messages.
+     */
+    @Override
+    List<String> getSubmitCommandLine(TaskRun task, Path scriptFile) {
+        return ['workbench', 'launch_job', '--cluster', cluster, '--name', getJobNameFor(task),
+                scriptFile.getName()]
+    }
+
     @Override
     def parseJobId(String text) {
-        final id = text.trim()
+        final id = text?.trim()
         if( !id )
             throw new IllegalStateException("Invalid Workbench submit response: empty job id")
         return id
     }
 
-    @Override
-    protected List<String> getKillCommand() {
-        return [launcherCli, 'kill']
+    /** How a Workbench job's status maps to Nextflow's. */
+    static QueueStatus queueStatusOf(Map job) {
+        switch( job.status as String ) {
+            case 'Finished':
+                return job.exitCode in [0, null] ? QueueStatus.DONE : QueueStatus.ERROR
+            case 'Failed':
+            case 'Killed':
+            case 'Canceled':
+                return QueueStatus.ERROR
+            case 'Running':
+                return QueueStatus.RUNNING
+            case 'Suspended':
+                return QueueStatus.HOLD
+            case 'Pending':
+                return QueueStatus.PENDING
+            default:
+                return QueueStatus.UNKNOWN
+        }
     }
 
+    /**
+     * Every job visible to the credentials, with one API call (two with job history); there is
+     * no queue or partition in the Workbench Jobs API. Null if Workbench can't be asked, as for
+     * a failed status command, so Nextflow keeps the last known states.
+     */
     @Override
-    protected List<String> queueStatusCommand(Object queue) {
-        // No `queue`/partition concept in the Workbench Jobs API -- one status command lists
-        // every job known to Workbench for the current credential, like `squeue` without `-p`.
-        return [launcherCli, 'status']
+    protected Map<String, QueueStatus> getQueueStatus0(Object queue) {
+        try {
+            final result = new LinkedHashMap<String, QueueStatus>()
+            client().statusMap().each { String id, Map job -> result.put(id, queueStatusOf(job)) }
+            return result
+        }
+        catch( Exception e ) {
+            log.warn "[WORKBENCH] cannot get the status of Workbench jobs: ${e.message}"
+            return null
+        }
     }
 
+    /** Stop jobs at once (SIGKILL), best-effort: a job may have ended already. */
     @Override
-    protected Map<String, QueueStatus> parseQueueStatus(String text) {
-        final result = new LinkedHashMap<String, QueueStatus>()
-        text.eachLine { String line ->
-            final trimmed = line.trim()
-            if( !trimmed )
-                return
-            final cols = trimmed.split(/\s+/)
-            if( cols.size() != 2 ) {
-                log.debug "[WORKBENCH] invalid status line: `$line`"
-                return
-            }
+    void killTask(Object jobId) {
+        final ids = jobId instanceof Collection ? (Collection) jobId : [jobId]
+        for( Object id : ids ) {
             try {
-                result.put(cols[0], QueueStatus.valueOf(cols[1]))
+                client().stopJob(id.toString(), true)
             }
-            catch( IllegalArgumentException e ) {
-                log.debug "[WORKBENCH] unknown status token in line: `$line`"
+            catch( Exception e ) {
+                log.debug "[WORKBENCH] cannot stop job $id: ${e.message}"
             }
         }
-        return result
     }
 
+    /** Not run: {@link #killTask} stops jobs with the API. */
+    @Override
+    protected List<String> getKillCommand() {
+        return ['workbench', 'stop_job']
+    }
+
+    /** Not run: {@link #getQueueStatus0} lists jobs with the API. */
+    @Override
+    protected List<String> queueStatusCommand(Object queue) {
+        return ['workbench', 'get_session']
+    }
+
+    /** Not used: {@link #getQueueStatus0} maps the API's job records directly. */
+    @Override
+    protected Map<String, QueueStatus> parseQueueStatus(String text) {
+        return [:]
+    }
 }

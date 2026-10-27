@@ -24,8 +24,6 @@ import nextflow.script.dsl.Description
 @CompileStatic
 class WorkbenchConfig implements ConfigScope {
 
-    static final String DEFAULT_LAUNCHER_CLI = 'posit-workbench-nf-launcher'
-
     @ConfigOption
     @Description('''
         Workbench cluster (compute environment) to submit jobs to, e.g. `Kubernetes` (required).
@@ -34,7 +32,7 @@ class WorkbenchConfig implements ConfigScope {
 
     @ConfigOption
     @Description('''
-        Command used to invoke the launcher CLI, resolved on the `PATH` of the `nextflow` process (default: `posit-workbench-nf-launcher`).
+        No longer used: the plugin calls the Workbench API itself. Kept so that existing configs that set it still validate.
     ''')
     final String launcherCli
 
@@ -55,7 +53,7 @@ class WorkbenchConfig implements ConfigScope {
 
     WorkbenchConfig(Map opts) {
         cluster = opts.cluster as String
-        launcherCli = (opts.launcherCli ?: DEFAULT_LAUNCHER_CLI) as String
+        launcherCli = opts.launcherCli as String
         resourceProfile = opts.resourceProfile as String
         eventsFile = opts.eventsFile as String
     }

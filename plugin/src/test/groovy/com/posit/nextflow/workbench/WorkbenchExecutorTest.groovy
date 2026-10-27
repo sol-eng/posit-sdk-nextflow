@@ -1,13 +1,13 @@
 package com.posit.nextflow.workbench
 
+import java.nio.file.Paths
+
 import nextflow.Session
 import nextflow.exception.AbortOperationException
-import nextflow.executor.AbstractGridExecutor
+import nextflow.executor.AbstractGridExecutor.QueueStatus
 import nextflow.executor.ExecutorConfig
 import nextflow.processor.TaskConfig
 import nextflow.processor.TaskRun
-import java.nio.file.Paths
-
 import spock.lang.Specification
 
 class WorkbenchExecutorTest extends Specification {
@@ -21,6 +21,12 @@ class WorkbenchExecutorTest extends Specification {
         return executor
     }
 
+    private TaskRun newTask(Map taskConfig) {
+        final task = Mock(TaskRun)
+        task.getConfig() >> new TaskConfig(taskConfig)
+        return task
+    }
+
     def 'should require a cluster to be configured'() {
         given:
         final executor = newExecutor([:])
@@ -32,9 +38,9 @@ class WorkbenchExecutorTest extends Specification {
         thrown(AbortOperationException)
     }
 
-    def 'should read cluster and launcherCli from the workbench config scope'() {
+    def 'should read the cluster from the workbench config scope'() {
         given:
-        final executor = newExecutor([cluster: 'my-cluster', launcherCli: '/opt/bin/my-launcher'])
+        final executor = newExecutor([cluster: 'my-cluster', launcherCli: 'ignored'])
 
         when:
         executor.register()
@@ -42,40 +48,9 @@ class WorkbenchExecutorTest extends Specification {
         then:
         noExceptionThrown()
         executor.cluster == 'my-cluster'
-        executor.launcherCli == '/opt/bin/my-launcher'
     }
 
-    def 'should default launcherCli when not configured'() {
-        given:
-        final executor = newExecutor([cluster: 'my-cluster'])
-
-        when:
-        executor.register()
-
-        then:
-        executor.launcherCli == 'posit-workbench-nf-launcher'
-    }
-
-    def 'should build the kill command with no ids appended'() {
-        given:
-        final executor = newExecutor([cluster: 'my-cluster', launcherCli: 'wb-launch'])
-        executor.register()
-
-        expect:
-        executor.getKillCommand() == ['wb-launch', 'kill']
-    }
-
-    def 'should build a single queue status command with no queue filtering'() {
-        given:
-        final executor = newExecutor([cluster: 'my-cluster', launcherCli: 'wb-launch'])
-        executor.register()
-
-        expect:
-        executor.queueStatusCommand(null) == ['wb-launch', 'status']
-        executor.queueStatusCommand('some-queue') == ['wb-launch', 'status']
-    }
-
-    def 'should parse a job id from the submit output'() {
+    def 'should parse a job id'() {
         given:
         final executor = newExecutor([cluster: 'my-cluster'])
         executor.register()
@@ -84,7 +59,7 @@ class WorkbenchExecutorTest extends Specification {
         executor.parseJobId('42\n') == '42'
     }
 
-    def 'should reject an empty submit response'() {
+    def 'should reject an empty job id'() {
         given:
         final executor = newExecutor([cluster: 'my-cluster'])
         executor.register()
@@ -94,49 +69,6 @@ class WorkbenchExecutorTest extends Specification {
 
         then:
         thrown(IllegalStateException)
-    }
-
-    def 'should map CLI status tokens to Nextflow QueueStatus values'() {
-        given:
-        final executor = newExecutor([cluster: 'my-cluster'])
-        executor.register()
-        final text = '''
-            1 PENDING
-            2 RUNNING
-            3 HOLD
-            4 DONE
-            5 ERROR
-        '''.stripIndent(true)
-
-        when:
-        final result = executor.parseQueueStatus(text)
-
-        then:
-        result == [
-            '1': AbstractGridExecutor.QueueStatus.PENDING,
-            '2': AbstractGridExecutor.QueueStatus.RUNNING,
-            '3': AbstractGridExecutor.QueueStatus.HOLD,
-            '4': AbstractGridExecutor.QueueStatus.DONE,
-            '5': AbstractGridExecutor.QueueStatus.ERROR,
-        ]
-    }
-
-    def 'should ignore malformed or unknown status lines'() {
-        given:
-        final executor = newExecutor([cluster: 'my-cluster'])
-        executor.register()
-
-        when:
-        final result = executor.parseQueueStatus('not-a-valid-line\n1 BOGUS\n2 RUNNING\n')
-
-        then:
-        result == ['2': AbstractGridExecutor.QueueStatus.RUNNING]
-    }
-
-    private TaskRun newTask(Map taskConfig) {
-        final task = Mock(TaskRun)
-        task.getConfig() >> new TaskConfig(taskConfig)
-        return task
     }
 
     def 'should leave resourceProfile unset by default'() {
@@ -159,30 +91,107 @@ class WorkbenchExecutorTest extends Specification {
         executor.resourceProfileFor(newTask([ext: [resourceProfile: 'large']])) == 'large'
     }
 
-    def 'should build the submit command line with resources, container and resource profile'() {
-        given:
-        final executor = newExecutor([cluster: 'k8s', launcherCli: 'wb-launch'], Spy(WorkbenchExecutor))
-        executor.register()
-        executor.getJobNameFor(_) >> 'nf-foo'
-        final task = newTask([cpus: 2, memory: '1 GB', ext: [resourceProfile: 'large']])
-        task.getContainer() >> 'python:3.12-slim'
-
-        expect:
-        executor.getSubmitCommandLine(task, Paths.get('/work/ab/cd/.command.run')) == [
-            'wb-launch', 'submit', '--cluster', 'k8s', '--name', 'nf-foo',
-            '--cpus', '2', '--mem-mb', '1024', '--container', 'python:3.12-slim',
-            '--resource-profile', 'large', '.command.run',
-        ]
-    }
-
-    def 'should omit the resource profile flag when none is configured'() {
+    def 'should build the job spec with resources, container and resource profile'() {
         given:
         final executor = newExecutor([cluster: 'k8s'], Spy(WorkbenchExecutor))
         executor.register()
         executor.getJobNameFor(_) >> 'nf-foo'
+        final task = newTask([cpus: 2, memory: '1 GB', ext: [resourceProfile: 'large']])
+        task.getContainer() >> 'python:3.12-slim'
+        task.getWorkDir() >> Paths.get('/work/ab/cd')
 
         expect:
-        !executor.getSubmitCommandLine(newTask([:]), Paths.get('.command.run')).contains('--resource-profile')
+        executor.jobSpec(task, Paths.get('/work/ab/cd/.command.run')) == [
+            cluster: 'k8s', name: 'nf-foo', exe: '/bin/bash',
+            args: ['/work/ab/cd/.command.run'], workingDirectory: '/work/ab/cd',
+            resourceLimits: [[type: 'cpuCount', value: '2'], [type: 'memory', value: '1024']],
+            container: [image: 'python:3.12-slim'], resourceProfile: 'large',
+        ]
     }
 
+    def 'should leave out what is not set'() {
+        given:
+        final executor = newExecutor([cluster: 'k8s'], Spy(WorkbenchExecutor))
+        executor.register()
+        executor.getJobNameFor(_) >> 'nf-foo'
+        final task = newTask([:])
+        task.getWorkDir() >> Paths.get('/w')
+
+        expect:
+        executor.jobSpec(task, Paths.get('/w/.command.run')).keySet() ==
+            ['cluster', 'name', 'exe', 'args', 'workingDirectory'] as Set
+    }
+
+    def 'should map Workbench job statuses to Nextflow queue statuses'() {
+        expect:
+        WorkbenchExecutor.queueStatusOf([status: status, exitCode: exit]) == expected
+
+        where:
+        status      | exit | expected
+        'Pending'   | null | QueueStatus.PENDING
+        'Running'   | null | QueueStatus.RUNNING
+        'Suspended' | null | QueueStatus.HOLD
+        'Finished'  | 0    | QueueStatus.DONE
+        'Finished'  | null | QueueStatus.DONE
+        'Finished'  | 1    | QueueStatus.ERROR
+        'Failed'    | null | QueueStatus.ERROR
+        'Killed'    | null | QueueStatus.ERROR
+        'Canceled'  | null | QueueStatus.ERROR
+        'Weird'     | null | QueueStatus.UNKNOWN
+    }
+
+    def 'should submit, list and stop jobs through the Workbench API'() {
+        given:
+        final stub = new StubWorkbench()
+        stub.replies.launch_job = [200, [result: [job: [id: '42']]]]
+        stub.replies.get_session = [200, [result: [jobs: [[id: '42', status: 'Running'], [id: '7', status: 'Finished', exitCode: 2]]]]]
+        final executor = newExecutor([cluster: 'k8s'], Spy(WorkbenchExecutor))
+        executor.register()
+        executor.client = new WorkbenchApiClient(stub.apiKeyEnv())
+        executor.getJobNameFor(_) >> 'nf-foo'
+        final task = newTask([:])
+        task.getWorkDir() >> Paths.get('/w')
+
+        expect:
+        executor.submitJob(task, Paths.get('/w/.command.run')) == '42'
+        executor.getQueueStatus0(null) == ['42': QueueStatus.RUNNING, '7': QueueStatus.ERROR]
+
+        when:
+        executor.killTask(['42', '7'])
+
+        then:
+        stub.requests.findAll { it.method == 'stop_job' }*.kwparams == [
+            [job_id: '42', force_quit: true], [job_id: '7', force_quit: true],
+        ]
+
+        cleanup:
+        stub.stop()
+    }
+
+    def 'should report no status when Workbench cannot be asked'() {
+        given:
+        final stub = new StubWorkbench()
+        stub.replies.get_historical_session = [500, 'boom']
+        final executor = newExecutor([cluster: 'k8s'])
+        executor.register()
+        executor.client = new WorkbenchApiClient(stub.apiKeyEnv())
+
+        expect:
+        executor.getQueueStatus0(null) == null
+
+        cleanup:
+        stub.stop()
+    }
+
+    def 'should create Workbench task handlers'() {
+        given:
+        final executor = newExecutor([cluster: 'k8s'])
+        executor.register()
+
+        final task = Mock(TaskRun)
+        task.getWorkDir() >> Paths.get('/w')
+
+        expect:
+        executor.createTaskHandler(task) instanceof WorkbenchTaskHandler
+    }
 }

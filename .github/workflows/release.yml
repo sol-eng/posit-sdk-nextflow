@@ -1,0 +1,47 @@
+# On a v* tag: builds the plugin zip and the launcher wheel, and attaches them to a GitHub
+# release (no plugin registry or PyPI publishing yet).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.8.2"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build
+        run: |
+          (cd plugin && gradle test assemble)
+          pip install build && python -m build --outdir dist launcher
+      - name: Check the tag matches the versions
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          grep -q "^version = '$tag'" plugin/build.gradle
+          grep -q "^version = \"$tag\"" launcher/pyproject.toml
+      # the notes are the version's CHANGELOG.md section, up to the next `## `
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '$0 ~ "^## "v" " {on=1; next} on && /^## / {exit} on' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "no CHANGELOG.md section for $version" >&2; exit 1; }
+          gh release create "$GITHUB_REF_NAME" plugin/build/distributions/nf-workbench-*.zip dist/* \
+            --title "$version" --notes-file notes.md

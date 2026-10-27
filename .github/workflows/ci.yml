@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plugin:
+    name: Plugin tests, build and end-to-end run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.8.2"
+      - name: Test and build
+        working-directory: plugin
+        run: gradle test assemble
+      # the real Nextflow with the plugin, against e2e/fake_workbench.py
+      - name: Install Nextflow
+        env:
+          NXF_VER: "25.10.0"
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          cd "$HOME/.local/bin" && curl -fsSL https://get.nextflow.io | bash
+          ./nextflow -version
+      - name: End-to-end run
+        env:
+          NEXTFLOW: /home/runner/.local/bin/nextflow
+          NXF_VER: "25.10.0"
+        run: e2e/run.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nf-workbench-plugin
+          path: plugin/build/distributions/*.zip
+
+  launcher:
+    name: Launcher lint and tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: launcher
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ".[dev]"
+      - run: |
+          ruff check src tests
+          ruff format --check src tests
+      - run: pytest

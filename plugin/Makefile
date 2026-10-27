@@ -16,6 +16,10 @@ clean:
 test:
 	$(GRADLE) test
 
+# Run the real Nextflow with the built plugin against e2e/fake_workbench.py
+e2e: assemble
+	../e2e/run.sh
+
 # Install the plugin into the local nextflow plugins dir (~/.nextflow/plugins)
 install:
 	$(GRADLE) install

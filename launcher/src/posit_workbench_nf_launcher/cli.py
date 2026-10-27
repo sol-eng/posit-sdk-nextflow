@@ -1,58 +1,38 @@
-"""CLI that submits/polls/cancels Posit Workbench Jobs on behalf of the nf-workbench Nextflow
-executor plugin (see ../../plugin). Mirrors the auth and job-lifecycle patterns used by the
-sibling Snakemake integration (posit-sdk-snakemake) so both stay consistent, without sharing
-code (kept independent by design -- see that repo if these two ever need to be unified).
+"""CLI that submits, lists and stops Posit Workbench Jobs from the command line.
 
-Subcommands are shaped to slot directly into Nextflow's AbstractGridExecutor grid-executor
-contract, the same shape as `sbatch`/`squeue`/`scancel`:
+The nf-workbench Nextflow plugin no longer needs it: since 0.4.0 the plugin calls the Workbench
+API itself. The CLI remains for the terminal, for scripts, and for submitting and stopping a
+headless Nextflow driver job (see docs/usage.md, "Headless runs"). It uses a built-in API client
+(``workbench.py``, standard library only), the same as the sibling Snakemake integration
+(posit-sdk-snakemake).
 
-- `submit`: prints the new job's id to stdout, mirroring `sbatch`.
-- `status`: prints one `<id> <STATE>` line per known job (no id filtering), mirroring `squeue`
-  listing every job for the current user.
-- `kill <id> [<id> ...]`: best-effort; mirrors `scancel`.
-
-`submit --env/--workdir` and `kill --graceful` are not used by the plugin; they let the same CLI
-submit and stop a headless Nextflow driver job (see docs/usage.md, "Headless runs").
-
-`clusters`, `whoami`, and `status --json` are not used by the plugin; they serve tools such as
-the Positron Nextflow extension (cluster pickers, diagnostics, single-job status).
+- `submit`: prints the new job's id to stdout, like `sbatch`. `--env`/`--workdir` are for driver
+  jobs.
+- `status`: prints one `<id> <STATE>` line per known job, like `squeue`; `--json [ids]` for
+  tools.
+- `kill <id> [<id> ...]`: best-effort, like `scancel`; `--graceful` sends SIGTERM.
+- `clusters`, `whoami`: cluster pickers and diagnostics, e.g. for the Positron Nextflow extension.
 
 `STATE` values are Nextflow's own `AbstractGridExecutor.QueueStatus` enum names (PENDING,
-RUNNING, HOLD, DONE, ERROR, UNKNOWN), computed here so the Groovy side only has to do
-`QueueStatus.valueOf(token)` -- the Workbench-status-to-Nextflow-status mapping lives in exactly
-one place (this file), not duplicated in Groovy.
+RUNNING, HOLD, DONE, ERROR, UNKNOWN), with the same mapping as the plugin's
+`WorkbenchExecutor.queueStatusOf`.
 """
 
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import os
 import sys
 
-import posit.workbench
-import posit.workbench.admin
-from posit.workbench import WorkbenchError, rpc
-
-_TERMINAL_FAILURE_STATUSES = frozenset({"Failed", "Killed", "Canceled"})
-
-
-def _make_client():
-    """Prefer the ambient in-session client; fall back to the Bearer-token admin client."""
-    try:
-        return posit.workbench.Client()
-    except OSError:
-        return posit.workbench.admin.Client()
-
-
-def _resource_limits(cpus: int | None, mem_mb: int | None) -> list[dict[str, str]] | None:
-    limits = []
-    if cpus:
-        limits.append({"type": "cpuCount", "value": str(cpus)})
-    if mem_mb:
-        limits.append({"type": "memory", "value": str(mem_mb)})
-    return limits or None
+from .workbench import (
+    TERMINAL_FAILURE_STATUSES,
+    WorkbenchError,
+    launch_job,
+    make_client,
+    resource_limits,
+    whoami,
+)
 
 
 def _environment(entries: list[str] | None) -> list[dict[str, str]] | None:
@@ -74,29 +54,19 @@ def cmd_submit(args: argparse.Namespace) -> int:
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    client = _make_client()
-    # Built via the SDK's job-spec builder + a raw `launch_job` call (rather than
-    # `client.jobs.launch`) because `jobs.launch` has no `resource_profile` parameter yet, while
-    # the Launcher API does accept -- and validate -- `resourceProfile` on the job spec. Switch
-    # back to `client.jobs.launch(..., resource_profile=...)` once posit-sdk exposes it.
-    spec = client.jobs._build_job(
-        args.cluster,
-        args.name,
-        "/bin/bash",
-        [os.path.abspath(args.script)],
-        working_directory=os.path.abspath(args.workdir) if args.workdir else None,
-        environment=environment,
-        tags=None,
-        container={"image": args.container} if args.container else None,
-        resource_limits=_resource_limits(args.cpus, args.mem_mb),
-        queues=None,
-        placement_constraints=None,
-        user=None,
-    )
-    if args.resource_profile:
-        spec["resourceProfile"] = args.resource_profile
     try:
-        job = rpc.call(client.jobs._ctx.client, "launch_job", job=spec)["job"]
+        job = launch_job(
+            make_client(),
+            cluster=args.cluster,
+            name=args.name,
+            exe="/bin/bash",
+            args=[os.path.abspath(args.script)],
+            working_directory=os.path.abspath(args.workdir) if args.workdir else None,
+            environment=environment,
+            container={"image": args.container} if args.container else None,
+            resource_limits=resource_limits(args.cpus, args.mem_mb),
+            resource_profile=args.resource_profile,
+        )
     except WorkbenchError as e:
         print(f"error: failed to submit job: {e}", file=sys.stderr)
         return 1
@@ -108,7 +78,7 @@ def _queue_status(job: dict) -> str:
     status = job.get("status")
     if status == "Finished":
         return "DONE" if job.get("exitCode") in (0, None) else "ERROR"
-    if status in _TERMINAL_FAILURE_STATUSES:
+    if status in TERMINAL_FAILURE_STATUSES:
         return "ERROR"
     if status == "Running":
         return "RUNNING"
@@ -120,7 +90,7 @@ def _queue_status(job: dict) -> str:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    client = _make_client()
+    client = make_client()
     jobs = client.jobs.get_status_map()
     if args.ids:
         jobs = {job_id: job for job_id, job in jobs.items() if job_id in args.ids}
@@ -137,7 +107,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_clusters(args: argparse.Namespace) -> int:
-    client = _make_client()
+    client = make_client()
     clusters = [
         {
             "name": c["name"],
@@ -154,22 +124,12 @@ def cmd_clusters(args: argparse.Namespace) -> int:
 
 
 def cmd_whoami(args: argparse.Namespace) -> int:
-    """Report which credential path is active, to check what Nextflow's subprocesses inherit."""
+    """Report which credentials are used, checked with one API call."""
     try:
-        client = posit.workbench.Client()
-        auth = "session"
-    except OSError:
-        try:
-            client = posit.workbench.admin.Client()
-        except OSError as e:
-            print(f"error: no Workbench credentials: {e}", file=sys.stderr)
-            return 1
-        auth = "api-key"
-    info = {
-        "auth": auth,
-        "server": str(getattr(client, "server_url", "") or os.environ.get("WORKBENCH_SERVER", "")),
-        "user": getpass.getuser(),
-    }
+        info = whoami()
+    except WorkbenchError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     if args.json:
         print(json.dumps(info))
     else:
@@ -178,7 +138,7 @@ def cmd_whoami(args: argparse.Namespace) -> int:
 
 
 def cmd_kill(args: argparse.Namespace) -> int:
-    client = _make_client()
+    client = make_client()
     for job_id in args.ids:
         try:
             # a graceful stop sends SIGTERM, so e.g. a Nextflow driver can cancel its tasks
@@ -241,7 +201,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except WorkbenchError as e:
+        # e.g. no session cookie and no WORKBENCH_SERVER/WORKBENCH_API_KEY
+        print(f"error: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
