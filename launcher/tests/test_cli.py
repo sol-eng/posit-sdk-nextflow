@@ -1,37 +1,67 @@
-"""Unit tests for the posit-workbench-nf-launcher CLI, mocking the Workbench HTTP API."""
+"""Unit tests for the posit-workbench-nf-launcher CLI, against a stub Workbench HTTP API."""
 
 from __future__ import annotations
 
 import json
-import re
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-import responses
 
 from posit_workbench_nf_launcher import cli
 
 
+class StubWorkbench:
+    """Records the API calls; answers each method with its queued replies (the last repeats)."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.replies: dict[str, list[tuple[int, object]]] = {}
+        stub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                stub.calls.append({**body, "headers": dict(self.headers)})
+                queue = stub.replies.get(body["method"]) or [(200, {"result": None})]
+                status, payload = queue.pop(0) if len(queue) > 1 else queue[0]
+                data = (
+                    payload.encode() if isinstance(payload, str) else json.dumps(payload).encode()
+                )
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def add(self, method: str, json: object, status: int = 200):
+        self.replies.setdefault(method, []).append((status, json))
+
+
 @pytest.fixture(autouse=True)
-def _admin_env(monkeypatch):
-    """Force the admin (Bearer-token) client path -- there's no ambient session in a test run."""
-    monkeypatch.delenv("POSIT_PRODUCT", raising=False)
-    monkeypatch.delenv("RS_SERVER_ADDRESS", raising=False)
-    monkeypatch.setenv("WORKBENCH_SERVER", "https://workbench.example.com")
+def wb(monkeypatch):
+    """The API-key credentials path, against the stub -- there's no session in a test run."""
+    stub = StubWorkbench()
+    for name in ("POSIT_PRODUCT", "RS_SERVER_ADDRESS", "PWB_SESSION_RUNTIME_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("WORKBENCH_SERVER", stub.url)
     monkeypatch.setenv("WORKBENCH_API_KEY", "test-token")
+    yield stub
+    stub.server.shutdown()
 
 
-def _rpc_url(method: str) -> re.Pattern:
-    return re.compile(rf".*/api/{method}$")
-
-
-@responses.activate
-def test_submit_prints_job_id(capsys, tmp_path):
+def test_submit_prints_job_id(wb, capsys, tmp_path):
     script = tmp_path / "run.sh"
     script.write_text("#!/bin/bash\necho hi\n")
 
-    responses.add(
-        responses.POST,
-        _rpc_url("launch_job"),
+    wb.add(
+        "launch_job",
         json={"result": {"job": {"id": "42"}}},
     )
 
@@ -53,7 +83,7 @@ def test_submit_prints_job_id(capsys, tmp_path):
     assert rc == 0
     assert capsys.readouterr().out.strip() == "42"
 
-    sent = json.loads(responses.calls[0].request.body)
+    sent = wb.calls[0]
     assert sent["method"] == "launch_job"
     job = sent["kwparams"]["job"]
     assert job["cluster"] == "Kubernetes"
@@ -66,14 +96,12 @@ def test_submit_prints_job_id(capsys, tmp_path):
     assert "resourceProfile" not in job
 
 
-@responses.activate
-def test_submit_passes_resource_profile(tmp_path):
+def test_submit_passes_resource_profile(wb, tmp_path):
     script = tmp_path / "run.sh"
     script.write_text("echo hi\n")
 
-    responses.add(
-        responses.POST,
-        _rpc_url("launch_job"),
+    wb.add(
+        "launch_job",
         json={"result": {"job": {"id": "43"}}},
     )
 
@@ -91,19 +119,17 @@ def test_submit_passes_resource_profile(tmp_path):
     )
 
     assert rc == 0
-    job = json.loads(responses.calls[0].request.body)["kwparams"]["job"]
+    job = wb.calls[0]["kwparams"]["job"]
     assert job["resourceProfile"] == "large"
     assert "resourceLimits" not in job
 
 
-@responses.activate
-def test_submit_with_container_reports_failure(tmp_path, capsys):
+def test_submit_with_container_reports_failure(wb, tmp_path, capsys):
     script = tmp_path / "run.sh"
     script.write_text("echo hi\n")
 
-    responses.add(
-        responses.POST,
-        _rpc_url("launch_job"),
+    wb.add(
+        "launch_job",
         json={"error": {"code": 1, "message": "cluster not found"}},
     )
 
@@ -124,16 +150,13 @@ def test_submit_with_container_reports_failure(tmp_path, capsys):
     assert "cluster not found" in capsys.readouterr().err
 
 
-@responses.activate
-def test_status_maps_workbench_states_to_queue_status(capsys):
-    responses.add(
-        responses.POST,
-        _rpc_url("get_historical_session"),
+def test_status_maps_workbench_states_to_queue_status(wb, capsys):
+    wb.add(
+        "get_historical_session",
         json={"result": {"jobs": []}},
     )
-    responses.add(
-        responses.POST,
-        _rpc_url("get_session"),
+    wb.add(
+        "get_session",
         json={
             "result": {
                 "jobs": [
@@ -162,31 +185,26 @@ def test_status_maps_workbench_states_to_queue_status(capsys):
     ]
 
 
-@responses.activate
-def test_kill_is_best_effort_on_already_finished_jobs():
-    responses.add(responses.POST, _rpc_url("stop_job"), json={"result": None})
-    responses.add(
-        responses.POST,
-        _rpc_url("stop_job"),
+def test_kill_is_best_effort_on_already_finished_jobs(wb):
+    wb.add("stop_job", json={"result": None})
+    wb.add(
+        "stop_job",
         json={"error": {"code": 2, "message": "job already finished"}},
     )
 
     rc = cli.main(["kill", "1", "2"])
 
     assert rc == 0
-    assert len(responses.calls) == 2
+    assert [c["method"] for c in wb.calls] == ["stop_job", "stop_job"]
 
 
-@responses.activate
-def test_status_json_filters_by_id(capsys):
-    responses.add(
-        responses.POST,
-        _rpc_url("get_historical_session"),
+def test_status_json_filters_by_id(wb, capsys):
+    wb.add(
+        "get_historical_session",
         json={"result": {"jobs": []}},
     )
-    responses.add(
-        responses.POST,
-        _rpc_url("get_session"),
+    wb.add(
+        "get_session",
         json={
             "result": {
                 "jobs": [
@@ -205,11 +223,9 @@ def test_status_json_filters_by_id(capsys):
     }
 
 
-@responses.activate
-def test_clusters_json_lists_resource_profiles(capsys):
-    responses.add(
-        responses.POST,
-        _rpc_url("get_compute_envs"),
+def test_clusters_json_lists_resource_profiles(wb, capsys):
+    wb.add(
+        "get_compute_envs",
         json={
             "result": {
                 "clusters": [
@@ -229,21 +245,22 @@ def test_clusters_json_lists_resource_profiles(capsys):
     ]
 
 
-def test_whoami_reports_the_api_key_path(capsys):
+def test_whoami_reports_the_api_key_path(wb, capsys):
+    wb.add("get_compute_envs", json={"result": {"clusters": []}})
     rc = cli.main(["whoami", "--json"])
 
     assert rc == 0
     info = json.loads(capsys.readouterr().out)
     assert info["auth"] == "api-key"
-    assert info["server"].startswith("https://workbench.example.com")
+    assert info["server"] == wb.url
+    assert wb.calls[0]["headers"]["Authorization"] == "Bearer test-token"
 
 
-@responses.activate
-def test_submit_sets_and_passes_through_environment(tmp_path, monkeypatch):
+def test_submit_sets_and_passes_through_environment(wb, tmp_path, monkeypatch):
     script = tmp_path / "driver.sh"
     script.write_text("exec nextflow run main.nf\n")
     monkeypatch.setenv("WORKBENCH_API_KEY", "test-token")
-    responses.add(responses.POST, _rpc_url("launch_job"), json={"result": {"job": {"id": "7"}}})
+    wb.add("launch_job", json={"result": {"job": {"id": "7"}}})
 
     rc = cli.main(
         [
@@ -263,7 +280,7 @@ def test_submit_sets_and_passes_through_environment(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-    job = json.loads(responses.calls[0].request.body)["kwparams"]["job"]
+    job = wb.calls[0]["kwparams"]["job"]
     assert job["environment"] == [
         {"name": "NXF_OPTS", "value": "-Xmx3g -Xms512m"},
         {"name": "WORKBENCH_API_KEY", "value": "test-token"},
@@ -271,7 +288,7 @@ def test_submit_sets_and_passes_through_environment(tmp_path, monkeypatch):
     assert job["workingDirectory"] == str(tmp_path)
 
 
-def test_submit_rejects_an_unset_pass_through_variable(tmp_path, monkeypatch, capsys):
+def test_submit_rejects_an_unset_pass_through_variable(wb, tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("NOT_SET_ANYWHERE", raising=False)
     script = tmp_path / "driver.sh"
     script.write_text("true\n")
@@ -284,25 +301,23 @@ def test_submit_rejects_an_unset_pass_through_variable(tmp_path, monkeypatch, ca
     assert "NOT_SET_ANYWHERE" in capsys.readouterr().err
 
 
-@responses.activate
-def test_submit_without_env_sends_no_environment(tmp_path):
+def test_submit_without_env_sends_no_environment(wb, tmp_path):
     script = tmp_path / "run.sh"
     script.write_text("true\n")
-    responses.add(responses.POST, _rpc_url("launch_job"), json={"result": {"job": {"id": "8"}}})
+    wb.add("launch_job", json={"result": {"job": {"id": "8"}}})
 
     assert cli.main(["submit", "--cluster", "K", "--name", "n", str(script)]) == 0
 
-    job = json.loads(responses.calls[0].request.body)["kwparams"]["job"]
+    job = wb.calls[0]["kwparams"]["job"]
     assert "environment" not in job
     assert "workingDirectory" not in job
 
 
-@responses.activate
 @pytest.mark.parametrize(("flags", "force_quit"), [([], True), (["--graceful"], False)])
-def test_kill_is_forced_unless_graceful(flags, force_quit):
-    responses.add(responses.POST, _rpc_url("stop_job"), json={"result": None})
+def test_kill_is_forced_unless_graceful(wb, flags, force_quit):
+    wb.add("stop_job", json={"result": None})
 
     assert cli.main(["kill", *flags, "42"]) == 0
 
-    sent = json.loads(responses.calls[0].request.body)["kwparams"]
+    sent = wb.calls[0]["kwparams"]
     assert sent == {"job_id": "42", "force_quit": force_quit}

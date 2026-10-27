@@ -4,13 +4,13 @@ import spock.lang.Specification
 
 class WorkbenchConfigTest extends Specification {
 
-    def 'should default launcherCli and leave the optional settings unset'() {
+    def 'should leave the optional settings unset'() {
         when:
         final config = new WorkbenchConfig([:])
 
         then:
         config.cluster == null
-        config.launcherCli == 'posit-workbench-nf-launcher'
+        config.launcherCli == null
         config.resourceProfile == null
     }
 

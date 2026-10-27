@@ -3,6 +3,21 @@
 All notable changes to `nf-workbench` (the Nextflow plugin) and `posit-workbench-nf-launcher`
 (the launcher CLI) are documented here. The two are versioned together.
 
+## 0.4.0 - unreleased
+
+### Changed
+
+- The plugin calls the Workbench Launcher API itself (`WorkbenchApiClient`, with the JDK's HTTP client) instead of shelling out to `posit-workbench-nf-launcher`. Nextflow needs no Python and no CLI to run tasks as Workbench Jobs, in a session, in a headless driver job, or anywhere with `WORKBENCH_SERVER`/`WORKBENCH_API_KEY`. Submit, status and kill keep their behaviour; the status mapping moved from the CLI into `WorkbenchExecutor.queueStatusOf`.
+- `workbench.launcherCli` is no longer used. It still validates, and logs a warning when set. The examples no longer set it, and have no `--launcherCli` param.
+- The launcher CLI is optional, for submitting, listing and stopping jobs from a terminal (e.g. a headless driver). It no longer depends on posit-sdk: it uses a built-in client (standard library only), the same as posit-sdk-snakemake's. `whoami` now checks the credentials with one API call.
+- A Workbench session without a readable RPC cookie falls back to `WORKBENCH_SERVER`/`WORKBENCH_API_KEY`, where posit-sdk failed.
+- The plugin and launcher are now 0.4.0. Update `plugins { id 'nf-workbench@0.4.0' }` in pipeline configs.
+
+### Added
+
+- `e2e/run.sh`: the real Nextflow with the built plugin against `e2e/fake_workbench.py`, a stand-in for the Launcher API that runs each job as a local process. It checks a completed run (the job spec: script, work dir, cpus, memory, resource profile) and a run stopped while its tasks run (status polled, jobs stopped).
+- CI: plugin tests and build, the end-to-end run, and the launcher tests.
+
 ## 0.3.0 - 2026-10-23
 
 ### Added

@@ -1,15 +1,16 @@
 # Usage reference
 
 How to use the `nf-workbench` executor in a Nextflow pipeline. It covers every setting the plugin
-reads, the command-line params defined by the bundled example, and the `posit-workbench-nf-launcher`
-CLI that the plugin calls. See the [root README](../README.md) for installation.
+reads, the command-line params defined by the bundled example, and the optional
+`posit-workbench-nf-launcher` CLI. See the [root README](../README.md) for installation.
 
 ## Plugin vs. example params
 
 Nextflow passes `--someName value` on the `nextflow run` command line through as `params.someName`.
 **The plugin reads no `params` itself.** It only reads `nextflow.config` settings
-(the `workbench` scope and `process.*`). `--workbenchCluster`, `--workbenchContainer`, and
-`--launcherCli` only work because `examples/nextflow.config` copies them into those settings. To
+(the `workbench` scope and `process.*`). `--workbenchCluster`, `--workbenchContainer` and
+`--workbenchResourceProfile` only work because `examples/nextflow.config` copies them into those
+settings. To
 get the same flags in your own pipeline, copy that pattern (see
 [Wiring params into config](#wiring-params-into-config)).
 
@@ -21,7 +22,6 @@ These are defined in `examples/nextflow.config`, for `nextflow run examples/main
 |---|---|---|---|
 | `--workbenchCluster NAME` | `Kubernetes` | `workbench.cluster` | Workbench cluster that jobs are submitted to. |
 | `--workbenchContainer IMG` | `python:3.12-slim` | `process.container` | Default image for processes that don't declare their own `container`. Processes that set `container` keep their own image. |
-| `--launcherCli PATH` | `posit-workbench-nf-launcher` | `workbench.launcherCli` | Path or name of the launcher CLI. Use an absolute path if the CLI isn't on `PATH`. |
 | `--workbenchResourceProfile NAME` | unset (cluster default) | `workbench.resourceProfile` | Workbench resource profile for every task. See [Resource profiles](#resource-profiles). |
 
 Example:
@@ -31,7 +31,6 @@ cd examples
 nextflow run main.nf \
     --workbenchCluster Kubernetes \
     --workbenchContainer python:3.12-slim \
-    --launcherCli ~/.local/bin/posit-workbench-nf-launcher \
     --workbenchResourceProfile custom \
     -resume
 ```
@@ -47,7 +46,7 @@ readability only: either way, authentication is chosen from the environment (see
 
 ```groovy
 plugins {
-    id 'nf-workbench@0.3.0'
+    id 'nf-workbench@0.4.0'
 }
 
 process {
@@ -67,15 +66,14 @@ so Nextflow checks the option names: a typo such as `clustr` produces
 | Setting | Required | Default | Description |
 |---|---|---|---|
 | `cluster` | **yes** | – | Workbench cluster name. The run stops at startup if this is unset. |
-| `launcherCli` | no | `posit-workbench-nf-launcher` | Command used to call the launcher CLI. It is looked up on the `PATH` of the `nextflow` process. |
+| `launcherCli` | no | – | No longer used since 0.4.0: the plugin calls the Workbench API itself. Setting it logs a warning. |
 | `resourceProfile` | no | unset | Default Workbench resource profile for every task. A single process can override it with `ext.resourceProfile`. If neither is set, Workbench uses the cluster's default profile (`custom` on a stock setup). |
 | `eventsFile` | no | unset | File that workflow and task events are appended to, one JSON object per line. Used by the Positron Nextflow extension to follow a run. See [Run events](#run-events). |
 
-To list valid cluster names:
+To list valid cluster names, use Workbench's Jobs UI, or the optional CLI:
 
-```python
-from posit.workbench.admin import Client   # or: from posit.workbench import Client, if in-session
-print([c["name"] for c in Client().compute_envs.list()["clusters"]])
+```bash
+posit-workbench-nf-launcher clusters
 ```
 
 ### Generic grid-executor settings
@@ -101,7 +99,7 @@ settings you're most likely to change:
 | `queueSize` | Maximum number of Workbench jobs Nextflow keeps submitted at once. |
 | `submitRateLimit` | Throttles job submission, e.g. `'10/1min'`. |
 | `pollInterval` | How often Nextflow checks tasks for completion (it looks for `.exitcode` in the work dir). |
-| `queueStatInterval` | How often `posit-workbench-nf-launcher status` runs. Each call lists **every** job visible to the credential, so on a busy Workbench a longer interval keeps the load down. |
+| `queueStatInterval` | How often the plugin asks Workbench for the status of its jobs. Each call lists **every** job visible to the credential, so on a busy Workbench a longer interval keeps the load down. |
 | `exitReadTimeout` | How long to wait for `.exitcode` after Workbench reports a job finished. Raise this if the shared filesystem is slow to sync. |
 
 ### Process directives
@@ -121,10 +119,8 @@ Jobs are named `nf-<process name>`, which is how they appear in the Workbench Jo
 Workbench admins define resource profiles per cluster, for example in
 `launcher.kubernetes.resources.conf`. To list the profiles available on a cluster:
 
-```python
-from posit.workbench.admin import Client   # or: from posit.workbench import Client, if in-session
-for c in Client().compute_envs.list()["clusters"]:
-    print(c["name"], [p["name"] for p in c.get("resourceProfiles") or []])
+```bash
+posit-workbench-nf-launcher clusters --json    # [{"name": ..., "resourceProfiles": [...]}]
 ```
 
 To select a profile for every task, or for individual processes:
@@ -161,8 +157,7 @@ process {
 }
 
 workbench {
-    cluster     = params.workbenchCluster ?: 'Kubernetes'
-    launcherCli = params.launcherCli ?: 'posit-workbench-nf-launcher'
+    cluster = params.workbenchCluster ?: 'Kubernetes'
 }
 ```
 
@@ -174,7 +169,7 @@ Events are written for any executor, not only `workbench`. To get them for a pip
 not otherwise use the plugin, load it on the command line:
 
 ```bash
-nextflow run main.nf -plugins nf-workbench@0.3.0 -c events.config   # events.config: workbench { eventsFile = 'events.ndjson' }
+nextflow run main.nf -plugins nf-workbench@0.4.0 -c events.config   # events.config: workbench { eventsFile = 'events.ndjson' }
 ```
 
 Every line has `event` and `utcTime`. Workflow events (`started`, `error`, `completed`) carry a
@@ -205,9 +200,9 @@ posit-workbench-nf-launcher submit --cluster Kubernetes --name nf-driver \
 A bare `--env NAME` passes the variable through from your environment. The token is then part of
 the job's environment, so anyone who can see the job's details can see it.
 
-The image needs bash, `ps` and Java 17 or later. Nextflow, this plugin and the launcher CLI are
-found in the shared home directory (`~/.local/bin`, `~/.nextflow/plugins`), or must be installed in
-the image.
+The image needs bash, `ps` and Java 17 or later. Nextflow and this plugin are found in the shared
+home directory (`~/.local/bin`, `~/.nextflow/plugins`), or must be installed in the image. The
+driver needs no Python: the plugin calls the Workbench API itself.
 
 To stop a headless run, stop its driver job with `posit-workbench-nf-launcher kill --graceful ID`.
 That sends SIGTERM, and Nextflow cancels its tasks before it exits. A plain `kill` sends SIGKILL,
@@ -216,24 +211,29 @@ which leaves the task jobs running.
 A driver job submitted from a Positron or RStudio Pro session needs no credentials passed in.
 Workbench gives every job credentials of its own (`RS_SESSION_RPC_COOKIE`, `POSIT_PRODUCT` and
 `RS_SERVER_ADDRESS`). They keep working after the session that submitted the job has stopped, and
-they expire 7 days after the job starts. The launcher in the driver uses them for every task job.
+they expire 7 days after the job starts. The plugin in the driver uses them for every task job.
 Do not pass a copy of the session's own cookie: it stops working when the session does.
 `examples/headless/check-session-credentials.sh` checks this on a cluster. The Positron Nextflow
 extension submits such a driver job for you ("As a Workbench Job" in Run Pipeline).
 
 ## Credentials
 
-The launcher CLI handles authentication using the environment it inherits from `nextflow`:
+The plugin authenticates with the credentials in the environment `nextflow` runs with:
 
 | Where `nextflow run` executes | What to set |
 |---|---|
-| Terminal inside a Positron / RStudio Pro Workbench session | Nothing. The session's own credentials are picked up automatically. |
-| Anywhere else (laptop, CI, a headless "driver" Workbench Job) | `WORKBENCH_SERVER` (Workbench URL) and `WORKBENCH_API_KEY` (API token). |
+| Terminal inside a Positron / RStudio Pro Workbench session | Nothing. The session's RPC cookie (`$PWB_SESSION_RUNTIME_DIR/rpc_cookie`) is used, against `RS_SERVER_ADDRESS`. |
+| A Workbench Job, e.g. a headless driver submitted from a session | Nothing. The job's own credentials (`RS_SESSION_RPC_COOKIE`, `RS_SERVER_ADDRESS`) are used. |
+| Anywhere else (laptop, CI) | `WORKBENCH_SERVER` (Workbench URL) and `WORKBENCH_API_KEY` (API token). |
+
+A server certificate from a private CA has to be in the JVM's trust store, e.g.
+`NXF_OPTS=-Djavax.net.ssl.trustStore=/path/to/truststore.jks`.
 
 ## Launcher CLI reference
 
-You don't normally call `posit-workbench-nf-launcher` yourself, but it's useful for debugging.
-Each subcommand can be run by hand with the same credentials Nextflow would use:
+The plugin doesn't need the CLI. It is a terminal tool for submitting, listing and stopping jobs,
+e.g. a headless driver, and for checking credentials. It uses the same credentials as the
+plugin, and needs Python 3.11 or later and nothing else (`pip install ./launcher`).
 
 ```text
 posit-workbench-nf-launcher submit --cluster NAME --name NAME
@@ -248,21 +248,23 @@ posit-workbench-nf-launcher whoami [--json]
 
 | Subcommand | Output | Notes |
 |---|---|---|
-| `submit` | The new job id on stdout | Runs `SCRIPT` with `/bin/bash`, as an absolute path on the shared filesystem. Exits 1 with `error: failed to submit job: ...` on stderr if the Workbench API rejects the job. `--env` sets the job's environment (a bare `--env KEY` passes a variable through) and `--workdir` its working directory; the plugin uses neither. |
+| `submit` | The new job id on stdout | Runs `SCRIPT` with `/bin/bash`, as an absolute path on the shared filesystem. Exits 1 with `error: failed to submit job: ...` on stderr if the Workbench API rejects the job. `--env` sets the job's environment (a bare `--env KEY` passes a variable through) and `--workdir` its working directory. |
 | `status` | One `<id> <STATE>` line per job | `STATE` is one of `PENDING`, `RUNNING`, `HOLD`, `DONE`, `ERROR`, `UNKNOWN`. |
 | `kill` | Nothing | Best-effort. Errors such as an already-finished job are ignored. Sends SIGKILL; `--graceful` sends SIGTERM so the job can clean up. |
-| `status --json` | `{"<id>": {"status": STATE, "workbenchStatus": ...}}` | Only the given ids, if any. Not used by the plugin. |
-| `clusters` | One cluster name per line; with `--json`, `[{"name", "resourceProfiles": [...]}]` | For cluster and profile pickers. Not used by the plugin. |
-| `whoami` | The user, credential path (`session` or `api-key`) and server | Checks which credentials Nextflow's subprocesses inherit. Not used by the plugin. |
+| `status --json` | `{"<id>": {"status": STATE, "workbenchStatus": ...}}` | Only the given ids, if any. |
+| `clusters` | One cluster name per line; with `--json`, `[{"name", "resourceProfiles": [...]}]` | For cluster and profile pickers. |
+| `whoami` | The user, credential path (`session` or `api-key`) and server | Checks the credentials with one API call. |
 
 ## Troubleshooting
 
 | Error | Cause / fix |
 |---|---|
-| `Cannot run program "posit-workbench-nf-launcher" ... No such file or directory` | The CLI isn't on the `PATH` of the `nextflow` process. Activate the launcher venv, install the CLI with `uv tool install ./launcher`, or set `launcherCli` / `--launcherCli` to an absolute path. |
+| `No Workbench credentials` | Nextflow runs outside a Workbench session or job, and `WORKBENCH_SERVER`/`WORKBENCH_API_KEY` aren't set. See [Credentials](#credentials). |
+| `Cannot run program "posit-workbench-nf-launcher"` | The plugin is 0.3.0 or older. 0.4.0 needs no CLI; update the plugin and the version in `plugins { id 'nf-workbench@...' }`. |
+| `PKIX path building failed` | The server's certificate is from a CA the JVM doesn't trust. Add it to a trust store, see [Credentials](#credentials). |
 | `Missing required config workbench.cluster` | Set `workbench.cluster`, or pass `--workbenchCluster` with the example config. |
 | `Unknown resource profile` | The profile name isn't defined for that cluster. Check the names with the snippet under [Resource profiles](#resource-profiles), and check both `workbench.resourceProfile` and any `ext.resourceProfile`. |
-| `Unrecognized config option 'executor.$workbench.cluster'` (or `launcherCli`/`resourceProfile`) | These settings moved to the top-level `workbench` scope. Change `executor { $workbench { cluster = ... } }` to `workbench { cluster = ... }`. |
+| `Unrecognized config option 'executor.$workbench.cluster'` (or `resourceProfile`) | These settings moved to the top-level `workbench` scope. Change `executor { $workbench { cluster = ... } }` to `workbench { cluster = ... }`. |
 | `Kubernetes requires the "container" parameter` | A process has no container. Set a default with `process.container` (or `--workbenchContainer` with the example config). |
-| Nextflow can't find or download plugin `nf-workbench` | Run `gradle install` in `plugin/`, and check that the version in `plugins { id 'nf-workbench@...' }` matches `plugin/build.gradle`. |
+| Nextflow can't find or download plugin `nf-workbench` | Unpack the release zip into `~/.nextflow/plugins/nf-workbench-<version>`, or run `gradle install` in `plugin/`, and check that the version in `plugins { id 'nf-workbench@...' }` matches `plugin/build.gradle`. |
 | Task hangs after its job finished in Workbench | `.exitcode` isn't visible from the Nextflow side. Check that the work dir is on a filesystem shared with the Workbench jobs, or raise `exitReadTimeout`. |
